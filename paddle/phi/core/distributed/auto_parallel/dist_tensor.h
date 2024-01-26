@@ -135,6 +135,7 @@ class DistTensor final
   /// \return The mutable pointer of DenseTensor value
   DenseTensor* unsafe_mutable_value() { return value_.get(); }
 
+  void clear() { value_->clear(); }
   /// \brief Returns the global dims of the dist tensor.
   /// \return The global dims of the dist tensor.
   const DDim& local_dims() const;

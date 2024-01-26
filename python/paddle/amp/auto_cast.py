@@ -47,6 +47,7 @@ class AMPGlobalState:
     def __init__(self):
         self.model_parameters = []
         self.use_master_grad = False
+        self.use_main_grad = False
         self.already_register_final_backward_hook = False
         self.amp_dtype = 'float32'
 
@@ -423,12 +424,21 @@ def amp_guard(
     ):
 
         def master_grad_hook():
-            core.eager.set_master_grads(amp_global_state().model_parameters)
+            initialized_params = [
+                param
+                for param in amp_global_state().model_parameters
+                if param._is_initialized()
+            ]
+            assert initialized_params is not None, "initialized_params is None"
+            core.eager.set_master_grads(initialized_params)
             amp_global_state().already_register_final_backward_hook = False
 
         core.eager._add_backward_final_hook(master_grad_hook)
         amp_global_state().already_register_final_backward_hook = True
 
+    if amp_global_state().use_main_grad:
+        for param in amp_global_state().model_parameters:
+            param._register_grad_hook(update_main_grad_hook(param))
     if tracer:
         # enable auto_cast
         original_amp_level = tracer._amp_level
@@ -467,6 +477,26 @@ def amp_guard(
             tracer._amp_dtype = original_amp_dtype
             if amp_level == AMP_LEVEL.O2:
                 tracer._use_promote = original_use_promote
+
+
+def update_main_grad_hook(param):
+    """Create the update_main_grad hook for backprop."""
+
+    # Hook used for back-prop and grad-merge.
+    @paddle.autograd.no_grad()
+    def param_hook(tmp_grad):
+        if tmp_grad is not None and tmp_grad._is_initialized():
+            if param.grad is None:
+                param.grad = core.eager.Tensor(
+                    value=tmp_grad.cast(paddle.float32).value(),
+                    place=tmp_grad.place,
+                    name="main_grad@" + param.name,
+                )
+            else:
+                param.grad.add_(tmp_grad)
+            tmp_grad._clear_data()
+
+    return param_hook
 
 
 class StateDictHook:
@@ -508,6 +538,7 @@ def amp_decorate(
     master_weight=None,
     save_dtype=None,
     master_grad=False,
+    main_grad=False,
     excluded_layers=None,
 ):
     """
@@ -665,8 +696,9 @@ def amp_decorate(
             _set_multi_precision(opt, use_multi_precision)
 
         # support master_grad
-        if master_grad:
-            amp_global_state().use_master_grad = True
+        if master_grad or main_grad:
+            # amp_global_state().use_master_grad = master_grad
+            amp_global_state().use_main_grad = master_grad
             for idx in range(len(models)):
                 amp_global_state().model_parameters.extend(
                     models[idx].parameters()
@@ -792,6 +824,7 @@ def decorate(
     master_weight=None,
     save_dtype=None,
     master_grad=False,
+    main_grad=False,
     excluded_layers=None,
 ):
     """
@@ -873,5 +906,6 @@ def decorate(
         master_weight,
         save_dtype,
         master_grad,
+        main_grad,
         excluded_layers,
     )

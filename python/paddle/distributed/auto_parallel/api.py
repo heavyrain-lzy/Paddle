@@ -13,13 +13,15 @@
 # limitations under the License.
 import copy
 from collections import defaultdict
+from types import MethodType
 from typing import Callable, List, Tuple, Union
 
 import numpy as np
 
 import paddle
 import paddle.distributed as dist
-from paddle import nn
+from paddle import _C_ops, nn
+from paddle.amp.grad_scaler import OptimizerState
 from paddle.base import unique_name
 from paddle.base.dygraph.base import switch_to_static_graph
 from paddle.base.framework import (
@@ -772,6 +774,112 @@ def shard_optimizer(optimizer, shard_fn=None):
 
     """
     return _ShardOptimizer(optimizer, shard_fn)
+
+
+def shard_gradscaler(gradscaler):
+    def unscale_method(self, optimizer):
+        if not self._enable:
+            return
+
+        optimizer_state = self._optimizer_states[id(optimizer)]
+
+        if optimizer_state["state"] is OptimizerState.UNSCALED:
+            raise RuntimeError(
+                "unscale_() has already been called on this optimizer since the last update()."
+            )
+        elif optimizer_state["state"] is OptimizerState.STEPPED:
+            raise RuntimeError("unscale_() is being called after step().")
+
+        param_grads = []
+        param_grads_bf16 = []
+        param_grads_fp16 = []
+        param_grads_fp32 = []
+        if getattr(optimizer, '_param_groups', None) and isinstance(
+            optimizer._param_groups[0], dict
+        ):
+            for group in optimizer._param_groups:
+                for param in group['params']:
+                    tgt_grad = None
+                    if (
+                        param._grad_ivar() is not None
+                        and param._is_initialized()
+                    ):
+                        tgt_grad = param_grads._grad_ivar()
+                    if tgt_grad is not None:
+                        param_grads.append(tgt_grad)
+                        if tgt_grad.dtype in [
+                            core.VarDesc.VarType.FP16,
+                            paddle.float16,
+                        ]:
+                            param_grads_fp16.append(tgt_grad)
+                        elif tgt_grad.dtype in [
+                            paddle.bfloat16,
+                        ]:
+                            param_grads_bf16.append(tgt_grad)
+                        else:
+                            param_grads_fp32.append(tgt_grad)
+        else:
+            param_grads = [
+                param._grad_ivar()
+                for param in optimizer._parameter_list
+                if param._grad_ivar() is not None and param._is_initialized()
+            ]
+            param_grads_fp16 = [
+                param
+                for param in param_grads
+                if param.dtype == core.VarDesc.VarType.FP16
+            ]
+            param_grads_bf16 = [
+                param
+                for param in param_grads
+                if param.dtype == core.VarDesc.VarType.BF16
+            ]
+            param_grads_fp32 = [
+                param
+                for param in param_grads
+                if param.dtype == core.VarDesc.VarType.FP32
+            ]
+        self._found_inf = self._temp_found_inf_value_false
+        if len(param_grads_fp16):
+            _C_ops.check_finite_and_unscale_(
+                param_grads_fp16,
+                self._scale,
+                param_grads_fp16,
+                self._temp_found_inf_fp16,
+            )
+
+            self._found_inf = _C_ops.bitwise_or(
+                self._found_inf, self._temp_found_inf_fp16
+            )
+        if len(param_grads_bf16):
+            _C_ops.check_finite_and_unscale_(
+                param_grads_bf16,
+                self._scale,
+                param_grads_bf16,
+                self._temp_found_inf_bf16,
+            )
+            self._found_inf = _C_ops.bitwise_or(
+                self._found_inf, self._temp_found_inf_bf16
+            )
+        if len(param_grads_fp32):
+            _C_ops.check_finite_and_unscale_(
+                param_grads_fp32,
+                self._scale,
+                param_grads_fp32,
+                self._temp_found_inf_fp32,
+            )
+            self._found_inf = _C_ops.bitwise_or(
+                self._found_inf, self._temp_found_inf_fp32
+            )
+        paddle.distributed.all_reduce(
+            self._found_inf, op=paddle.distributed.ReduceOp.MAX, group=None
+        )
+        self._found_inf = self._found_inf.cast("bool")
+        optimizer_state["state"] = OptimizerState.UNSCALED
+
+    gradscaler._unscale = MethodType(unscale_method, gradscaler)
+
+    return gradscaler
 
 
 # Part4: Convert To Static Graph related APIs
